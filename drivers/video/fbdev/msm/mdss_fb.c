@@ -56,6 +56,10 @@
 #include "mdss_smmu.h"
 #include "mdss_mdp.h"
 
+#ifdef CONFIG_FLICKER_FREE
+#include "flicker_free.h"
+#endif
+
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MDSS_FB_NUM 3
 #else
@@ -1599,6 +1603,11 @@ static int mdss_fb_probe(struct platform_device *pdev)
 	mfd->index = fbi_list_index;
 	mfd->mdp_fb_page_protection = MDP_FB_PAGE_PROTECTION_WRITECOMBINE;
 
+	if (!lcd_backlight_registered) {
+		backlight_led.brightness = mfd->panel_info->brightness_max;
+		backlight_led.max_brightness = mfd->panel_info->brightness_max;
+	}
+
 	mfd->ext_ad_ctrl = -1;
 	if (mfd->panel_info && mfd->panel_info->brightness_max > 0)
 		MDSS_BRIGHT_TO_BL(mfd->bl_level, backlight_led.brightness,
@@ -1665,8 +1674,6 @@ static int mdss_fb_probe(struct platform_device *pdev)
 
 	/* android supports only one lcd-backlight/lcd for now */
 	if (!lcd_backlight_registered) {
-		backlight_led.brightness = mfd->panel_info->brightness_max;
-		backlight_led.max_brightness = mfd->panel_info->brightness_max;
 		if (led_classdev_register(&pdev->dev, &backlight_led))
 			pr_err("led_classdev_register failed\n");
 		else
@@ -2071,6 +2078,10 @@ void mdss_fb_set_backlight(struct msm_fb_data_type *mfd, u32 bkl_lvl)
 				bl_notify_needed = true;
 			pr_debug("backlight sent to panel :%d\n", temp);
 			pdata->set_backlight(pdata, temp);
+#ifdef CONFIG_FLICKER_FREE
+			ff_mfd_copy = mfd;
+			ff_bl_lvl_cpy = temp;
+#endif
 			mfd->bl_level = bkl_lvl;
 			mfd->bl_level_scaled = temp;
 		}
@@ -2104,6 +2115,10 @@ void mdss_fb_update_backlight(struct msm_fb_data_type *mfd)
 				mdss_fb_bl_update_notify(mfd,
 					NOTIFY_TYPE_BL_AD_ATTEN_UPDATE);
 			mdss_fb_bl_update_notify(mfd, NOTIFY_TYPE_BL_UPDATE);
+#ifdef CONFIG_FLICKER_FREE
+			ff_mfd_copy = mfd;
+			ff_bl_lvl_cpy = temp;
+#endif
 			pdata->set_backlight(pdata, temp);
 			mfd->bl_level_scaled = mfd->unset_bl_level;
 			mfd->allow_bl_update = true;

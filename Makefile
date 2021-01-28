@@ -1,6 +1,6 @@
 VERSION = 4
 PATCHLEVEL = 4
-SUBLEVEL = 251
+SUBLEVEL = 252
 EXTRAVERSION =
 NAME = Blurry Fish Butt
 
@@ -339,6 +339,7 @@ include scripts/Kbuild.include
 # Make variables (CC, etc...)
 AS		= $(CROSS_COMPILE)as
 LD		= $(CROSS_COMPILE)ld
+LDGOLD		= $(CROSS_COMPILE)ld.gold
 CC		= $(CROSS_COMPILE)gcc
 CPP		= $(CC) -E
 AR		= $(CROSS_COMPILE)ar
@@ -628,6 +629,28 @@ CLANG_FLAGS    += $(call cc-option, -Wno-misleading-indentation)
 CLANG_FLAGS    += $(call cc-option, -Wno-bool-operation)
 KBUILD_CFLAGS	+= $(CLANG_FLAGS)
 KBUILD_AFLAGS	+= $(CLANG_FLAGS)
+ifeq ($(ld-name),lld)
+KBUILD_CFLAGS += -fuse-ld=lld
+endif
+KBUILD_CPPFLAGS += -Qunused-arguments
+endif
+
+# Make toolchain changes before including arch/$(SRCARCH)/Makefile to ensure
+# ar/cc/ld-* macros return correct values.
+ifdef CONFIG_LTO_CLANG
+ifneq ($(ld-name),lld)
+# use GNU gold with LLVMgold for LTO linking, and LD for vmlinux_link
+LDFINAL_vmlinux := $(LD)
+LD		:= $(LDGOLD)
+LDFLAGS		+= -plugin LLVMgold.so
+endif
+# use llvm-ar for building symbol tables from IR files, and llvm-dis instead
+# of objdump for processing symbol versions and exports
+LLVM_AR		:= llvm-ar
+LLVM_NM		:= llvm-nm
+export LLVM_AR LLVM_NM
+# Set O3 optimization level for LTO
+LDFLAGS		+= --plugin-opt=O3
 endif
 
 # The arch Makefile can set ARCH_{CPP,A,C}FLAGS to override the default
@@ -648,7 +671,17 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning, attribute-alias)
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os
 else
+ifdef CONFIG_PROFILE_ALL_BRANCHES
+KBUILD_CFLAGS	+= -O2
+else
+ifeq ($(cc-name),gcc)
+KBUILD_CFLAGS   += -O2
+endif
+ifeq ($(cc-name),clang)
 KBUILD_CFLAGS   += -O3
+KBUILD_CFLAGS	+= -mcpu=cortex-a73 -mtune=cortex-a73
+endif
+endif
 endif
 
 ifdef CONFIG_CC_WERROR
@@ -729,7 +762,6 @@ LDFLAGS += -O2
 endif
 
 ifeq ($(cc-name),clang)
-KBUILD_CPPFLAGS += $(call cc-option,-Qunused-arguments,)
 KBUILD_CFLAGS += $(call cc-disable-warning, format-invalid-specifier)
 KBUILD_CFLAGS += $(call cc-disable-warning, gnu)
 KBUILD_CFLAGS += $(call cc-disable-warning, duplicate-decl-specifier)
@@ -748,6 +780,10 @@ else
 # These warnings generated too much noise in a regular build.
 # Use make W=1 to enable them (see scripts/Makefile.extrawarn)
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-but-set-variable)
+endif
+
+ifeq ($(ld-name),lld)
+LDFLAGS += -O2
 endif
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
@@ -809,6 +845,40 @@ endif
 ifdef CONFIG_LD_DEAD_CODE_DATA_ELIMINATION
 KBUILD_CFLAGS	+= $(call cc-option,-ffunction-sections,)
 KBUILD_CFLAGS	+= $(call cc-option,-fdata-sections,)
+endif
+
+ifdef CONFIG_LTO_CLANG
+ifdef CONFIG_THINLTO
+lto-clang-flags	:= -flto=thin
+LDFLAGS		+= --thinlto-cache-dir=.thinlto-cache
+else
+lto-clang-flags	:= -flto
+endif
+lto-clang-flags += -fvisibility=default $(call cc-option, -fsplit-lto-unit)
+
+# Limit inlining across translation units to reduce binary size
+LD_FLAGS_LTO_CLANG := -mllvm -import-instr-limit=5
+
+KBUILD_LDFLAGS += $(LD_FLAGS_LTO_CLANG)
+KBUILD_LDFLAGS_MODULE += $(LD_FLAGS_LTO_CLANG)
+
+KBUILD_LDS_MODULE += $(srctree)/scripts/module-lto.lds
+
+# allow disabling only clang LTO where needed
+DISABLE_LTO_CLANG := -fno-lto
+export DISABLE_LTO_CLANG
+endif
+
+ifdef CONFIG_LTO
+lto-flags	:= $(lto-clang-flags)
+KBUILD_CFLAGS	+= $(lto-flags)
+
+DISABLE_LTO	:= $(DISABLE_LTO_CLANG)
+export DISABLE_LTO
+
+# LDFINAL_vmlinux and LDFLAGS_FINAL_vmlinux can be set to override
+# the linker and flags for vmlinux_link.
+export LDFINAL_vmlinux LDFLAGS_FINAL_vmlinux
 endif
 
 # arch Makefile may override CC so keep this after arch Makefile is included
@@ -1007,9 +1077,12 @@ export KBUILD_ALLDIRS := $(sort $(filter-out arch/%,$(vmlinux-alldirs)) arch Doc
 
 vmlinux-deps := $(KBUILD_LDS) $(KBUILD_VMLINUX_INIT) $(KBUILD_VMLINUX_MAIN) $(KBUILD_VMLINUX_LIBS)
 
-# Final link of vmlinux
-      cmd_link-vmlinux = $(CONFIG_SHELL) $< $(LD) $(LDFLAGS) $(LDFLAGS_vmlinux)
-quiet_cmd_link-vmlinux = LINK    $@
+ARCH_POSTLINK := $(wildcard $(srctree)/arch/$(SRCARCH)/Makefile.postlink)
+
+# Final link of vmlinux with optional arch pass after final link
+    cmd_link-vmlinux =                                                 \
+	$(CONFIG_SHELL) $< $(LD) $(LDFLAGS) $(LDFLAGS_vmlinux) ;       \
+	$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) $@, true)
 
 # Include targets which we want to
 # execute if the rest of the kernel build went well.
@@ -1087,6 +1160,25 @@ prepare0: archprepare
 
 # All the preparing..
 prepare: prepare0
+
+# Make sure we're using a supported toolchain with LTO_CLANG
+ifdef CONFIG_LTO_CLANG
+  ifneq ($(call clang-ifversion, -ge, 0500, y), y)
+	@echo Cannot use CONFIG_LTO_CLANG: requires clang 5.0 or later >&2 && exit 1
+  endif
+  ifneq ($(ld-name),lld)
+    ifneq ($(call gold-ifversion, -ge, 112000000, y), y)
+         @echo Cannot use CONFIG_LTO_CLANG: requires GNU gold 1.12 or later >&2 && exit 1
+    endif
+  endif
+endif
+# Make sure compiler supports LTO flags
+ifdef lto-flags
+  ifeq ($(call cc-option, $(lto-flags)),)
+	@echo Cannot use CONFIG_LTO: $(lto-flags) not supported by compiler \
+		>&2 && exit 1
+  endif
+endif
 
 # Generate some files
 # ---------------------------------------------------------------------------
@@ -1303,6 +1395,7 @@ $(clean-dirs):
 
 vmlinuxclean:
 	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/link-vmlinux.sh clean
+	$(Q)$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) clean)
 
 clean: archclean vmlinuxclean
 
@@ -1548,8 +1641,8 @@ clean: $(clean-dirs)
 		-o -name '*.symtypes' -o -name 'modules.order' \
 		-o -name modules.builtin -o -name '.tmp_*.o.*' \
 		-o -name '*.ll' \
-		-o -name '*.gcno' \) -type f -print | xargs rm -f
-
+		-o -name '*.gcno' \
+		-o -name '*.*.symversions' \) -type f -print | xargs rm -f
 # Generate tags for editors
 # ---------------------------------------------------------------------------
 quiet_cmd_tags = GEN     $@
